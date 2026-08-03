@@ -71,11 +71,20 @@ function genericErrorResponseChecks (t, response) {
 }
 
 function rawGet (port, requestPath) {
+  return rawRequest(`http://127.0.0.1:${port}`, requestPath)
+}
+
+function rawRequest (baseUrl, route) {
+  const base = new URL(baseUrl)
+  const hostname = base.hostname.startsWith('[')
+    ? base.hostname.slice(1, -1)
+    : base.hostname
+
   return new Promise((resolve, reject) => {
     const request = http.request({
-      host: '127.0.0.1',
-      port,
-      path: requestPath,
+      host: hostname,
+      port: base.port,
+      path: route,
       method: 'GET',
       agent: false
     }, (response) => {
@@ -85,6 +94,7 @@ function rawGet (port, requestPath) {
       response.on('end', () => {
         resolve({
           statusCode: response.statusCode,
+          headers: response.headers,
           body
         })
       })
@@ -960,6 +970,157 @@ test('allowedPath option - pathname', async (t) => {
     const response = await fetch('http://localhost:' + fastify.server.address().port + '/index.css')
     t.assert.ok(response.ok)
     t.assert.deepStrictEqual(response.status, 200)
+  })
+})
+
+test('allowedPath option - pathname is normalized before filtering', async (t) => {
+  t.plan(4)
+
+  const pluginOptions = {
+    root: path.join(__dirname, '/static'),
+    allowedPath: (pathName) => pathName !== '/foobar.html'
+  }
+  const fastify = Fastify()
+  fastify.register(fastifyStatic, pluginOptions)
+
+  t.after(() => fastify.close())
+
+  const address = await fastify.listen({ port: 0 })
+  fastify.server.unref()
+
+  await t.test('/foobar.html not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '/foobar.html')
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('//foobar.html not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '//foobar.html')
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('/./foobar.html not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '/./foobar.html')
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('/index.css found', async (t) => {
+    t.plan(2)
+
+    const response = await rawRequest(address, '/index.css')
+    t.assert.deepStrictEqual(response.statusCode, 200)
+    t.assert.ok(/text\/css/.test(response.headers['content-type']))
+  })
+})
+
+test('allowedPath option - non-canonical pathnames do not bypass filtering', async (t) => {
+  t.plan(5)
+
+  const deniedPathname = '/deep/path/for/test/purpose/foo.html'
+  const pluginOptions = {
+    root: path.join(__dirname, '/static'),
+    allowedPath: (pathName) => pathName !== deniedPathname
+  }
+  const fastify = Fastify()
+  fastify.register(fastifyStatic, pluginOptions)
+
+  t.after(() => fastify.close())
+
+  const address = await fastify.listen({ port: 0 })
+  fastify.server.unref()
+
+  await t.test('/deep/path/for/test/purpose/foo.html not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, deniedPathname)
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('duplicate path separators not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '/deep/path/for/test/purpose//foo.html')
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('mixed dot segments and duplicate separators not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '/deep/path//for/./test/purpose/foo.html')
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('encoded dot segment not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '/%2E/deep/path/for/test/purpose/foo.html')
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('allowed file with duplicate path separators found', async (t) => {
+    t.plan(2)
+
+    const response = await rawRequest(address, '/deep/path//for/test/index.html')
+    t.assert.deepStrictEqual(response.statusCode, 200)
+    t.assert.deepStrictEqual(response.body, innerIndex)
+  })
+})
+
+test('allowedPath option - request subtree checks use normalized pathname', async (t) => {
+  t.plan(3)
+
+  const pluginOptions = {
+    root: path.join(__dirname, '/static-allowed-path'),
+    allowedPath: (pathName, _root, request) => {
+      if (request.headers['x-admin'] === '1') {
+        return true
+      }
+
+      return pathName.startsWith('/public/')
+    }
+  }
+  const fastify = Fastify()
+  fastify.register(fastifyStatic, pluginOptions)
+
+  t.after(() => fastify.close())
+
+  const address = await fastify.listen({ port: 0 })
+  fastify.server.unref()
+
+  await t.test('/public/index.html found', async (t) => {
+    t.plan(2)
+
+    const response = await rawRequest(address, '/public/index.html')
+    t.assert.deepStrictEqual(response.statusCode, 200)
+    t.assert.deepStrictEqual(response.body, 'public\n')
+  })
+
+  await t.test('/private/secret.txt not found', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '/private/secret.txt')
+    t.assert.deepStrictEqual(response.statusCode, 404)
+    genericErrorResponseChecks(t, response)
+  })
+
+  await t.test('/public/../private/secret.txt forbidden', async (t) => {
+    t.plan(1 + GENERIC_ERROR_RESPONSE_CHECK_COUNT)
+
+    const response = await rawRequest(address, '/public/../private/secret.txt')
+    t.assert.deepStrictEqual(response.statusCode, 403)
+    genericErrorResponseChecks(t, response)
   })
 })
 
